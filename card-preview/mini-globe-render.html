@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0a1120; }
+  #stage {
+    width: 930px; height: 640px; position: relative;
+    background:
+      radial-gradient(620px 620px at 68% 42%, rgba(64, 98, 190, 0.28), transparent 62%),
+      radial-gradient(500px 500px at 15% 90%, rgba(38, 70, 150, 0.18), transparent 60%),
+      linear-gradient(160deg, #0b1428 0%, #080f1f 55%, #070c18 100%);
+  }
+  #stage canvas { position: absolute; inset: 0; display: block; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ---- constants matched to the card content box (465.4 x 319.9 px @1x) ---- */
+const W = 930, H = 640;
+const DEG = Math.PI / 180;
+
+/* ---- loop timing: exactly one full revolution, no duplicate seam frame ---- */
+const FPS = 30;
+const DURATION_S = 10;
+const TOTAL_FRAMES = FPS * DURATION_S;   // 300 — caller renders i = 0..TOTAL_FRAMES-1
+
+function latLngToVec3(lat, lng, r) {
+  const phi = (90 - lat) * DEG;
+  const theta = (lng + 180) * DEG;
+  return new THREE.Vector3(-r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+}
+
+/* ---- shaders: same look as the main app (terrain relief + night lights + rim) ---- */
+const EARTH_VERT = `
+  varying vec2 vUv; varying vec3 vWorldNormal; varying vec3 vViewNormal; varying vec3 vWorldPos;
+  void main() {
+    vUv = uv;
+    vWorldNormal = normalize(mat3(modelMatrix) * normal);
+    vViewNormal  = normalize(normalMatrix * normal);
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    vWorldPos = wp.xyz;
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }
+`;
+const EARTH_FRAG = `
+  uniform sampler2D dayMap; uniform sampler2D nightMap; uniform sampler2D topoMap; uniform sampler2D waterMap;
+  uniform vec3 sunDir;
+  varying vec2 vUv; varying vec3 vWorldNormal; varying vec3 vViewNormal; varying vec3 vWorldPos;
+  void main() {
+    vec3 N = normalize(vWorldNormal);
+    vec3 S = normalize(sunDir);
+    vec3 day = texture2D(dayMap, vUv).rgb;
+    vec3 night = texture2D(nightMap, vUv).rgb;
+    float sunDot = dot(N, S);
+    float dayFactor = smoothstep(-0.45, 0.05, sunDot);
+    day = pow(day, vec3(1.03)) * vec3(1.08, 1.10, 1.14);
+
+    vec2 texel = vec2(1.0 / 4096.0, 1.0 / 2048.0);
+    float h  = texture2D(topoMap, vUv).r;
+    float hU = texture2D(topoMap, vUv + vec2(texel.x, 0.0)).r;
+    float hV = texture2D(topoMap, vUv + vec2(0.0, texel.y)).r;
+    vec3 tE = normalize(cross(vec3(0.0, 1.0, 0.0), N));
+    vec3 tN = normalize(cross(N, tE));
+    vec3 Nb = normalize(N - ((hU - h) * tE + (hV - h) * tN) * 18.0);
+    float relief = dot(Nb, S) - sunDot;
+    float water = texture2D(waterMap, vUv).r;
+    day *= 1.0 + relief * (1.0 - water) * 2.2;
+
+    vec3 nightGlow = night * vec3(1.0, 0.82, 0.55) * 2.1;
+    vec3 color = mix(nightGlow, day, dayFactor);
+    float twilight = smoothstep(-0.18, 0.0, sunDot) * (1.0 - smoothstep(0.0, 0.25, sunDot));
+    color += vec3(0.9, 0.45, 0.15) * twilight * 0.16;
+
+    vec3 V = normalize(cameraPosition - vWorldPos);
+    vec3 Hh = normalize(S + V);
+    color += vec3(0.9, 0.95, 1.0) * pow(max(dot(N, Hh), 0.0), 48.0) * 0.4 * water * dayFactor;
+
+    float rim = pow(1.0 - abs(normalize(vViewNormal).z), 2.4);
+    color += vec3(0.30, 0.52, 1.0) * rim * (0.22 + 0.5 * dayFactor);
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+const ATMO_VERT = `varying vec3 vN; void main(){ vN = normalize(normalMatrix*normal); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`;
+const ATMO_FRAG = `varying vec3 vN; void main(){ float i = pow(0.62 - dot(vN, vec3(0.0,0.0,1.0)), 4.0); gl_FragColor = vec4(0.28,0.55,1.0,1.0) * i; }`;
+const ARC_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }`;
+const ARC_FRAG = `
+  uniform float uTime; uniform vec3 uColorA; uniform vec3 uColorB; uniform float uSpeed; uniform float uBase; uniform float uPhase;
+  varying vec2 vUv;
+  void main() {
+    float u = vUv.x;
+    vec3 col = mix(uColorA, uColorB, smoothstep(0.1, 0.75, u));
+    float p = fract(u - uTime * uSpeed + uPhase);
+    float comet = pow(smoothstep(0.35, 1.0, p), 3.0);
+    gl_FragColor = vec4(col * (uBase + comet * 1.3), 1.0);
+  }
+`;
+
+function makeGlowTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(120,205,255,0.85)'); g.addColorStop(0.35, 'rgba(80,160,255,0.32)'); g.addColorStop(1, 'rgba(60,130,255,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(2);            // supersample for AA; the host page displays at CSS 930x640
+renderer.setSize(W, H);
+renderer.setClearColor(0x0a1120, 1);
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, W / H, 0.1, 100);
+camera.position.set(0, 0, 5.1);          // pulled back for comfortable padding in a small card
+camera.lookAt(0, 0, 0);
+
+const sunDir = new THREE.Vector3(0.32, 0.22, 0.92).normalize();   // near-camera sun: bright face, thin twilight rim
+const sunLight = new THREE.DirectionalLight(0xfff2dd, 2.4);
+sunLight.position.copy(sunDir).multiplyScalar(5);
+scene.add(sunLight, new THREE.AmbientLight(0x223355, 0.55));
+
+// stars
+const starGeo = new THREE.BufferGeometry();
+const starCount = 500;
+const starPos = new Float32Array(starCount * 3);
+for (let i = 0; i < starCount; i++) {
+  const v = new THREE.Vector3().randomDirection().multiplyScalar(30 + Math.random() * 30);
+  starPos.set([v.x, v.y, v.z], i * 3);
+}
+starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0x9db8ff, size: 1.3, sizeAttenuation: false, transparent: true, opacity: 0.4 })));
+
+const loader = new THREE.TextureLoader();
+loader.setCrossOrigin('anonymous');
+const load = (url) => new Promise((res, rej) => loader.load(url, res, undefined, rej));
+
+const [dayTex, nightTex, cloudsTex, topoTex, waterTex] = await Promise.all([
+  load('https://unpkg.com/three-globe@2.31.0/example/img/earth-blue-marble.jpg'),
+  load('https://unpkg.com/three-globe@2.31.0/example/img/earth-night.jpg'),
+  load('https://raw.githubusercontent.com/turban/webgl-earth/master/images/fair_clouds_4k.png'),
+  load('https://unpkg.com/three-globe@2.31.0/example/img/earth-topology.png'),
+  load('https://unpkg.com/three-globe@2.31.0/example/img/earth-water.png'),
+]);
+// only the true colour maps get sRGB decoding — topo/water are data textures
+// and must stay linear, or the relief-bump lighting math comes out corrupted
+[dayTex, nightTex, cloudsTex].forEach(t => { t.colorSpace = THREE.SRGBColorSpace; });
+[dayTex, nightTex, cloudsTex, topoTex, waterTex].forEach(t => { t.anisotropy = 8; });
+
+const earthGroup = new THREE.Group();
+earthGroup.rotation.order = 'XYZ';
+earthGroup.rotation.x = 0.14;
+scene.add(earthGroup);
+
+const earthMat = new THREE.ShaderMaterial({
+  uniforms: { dayMap: { value: dayTex }, nightMap: { value: nightTex }, topoMap: { value: topoTex }, waterMap: { value: waterTex }, sunDir: { value: sunDir } },
+  vertexShader: EARTH_VERT, fragmentShader: EARTH_FRAG,
+});
+earthGroup.add(new THREE.Mesh(new THREE.SphereGeometry(1, 96, 96), earthMat));
+
+const cloudsGroup = new THREE.Group();
+earthGroup.add(cloudsGroup);
+cloudsGroup.add(new THREE.Mesh(
+  new THREE.SphereGeometry(1.012, 72, 72),
+  new THREE.MeshLambertMaterial({ map: cloudsTex, transparent: true, opacity: 0.5, depthWrite: false })
+));
+
+const atmo = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 48),
+  new THREE.ShaderMaterial({ vertexShader: ATMO_VERT, fragmentShader: ATMO_FRAG, blending: THREE.AdditiveBlending, side: THREE.BackSide, transparent: true, depthWrite: false }));
+atmo.scale.setScalar(1.16);
+scene.add(atmo);
+
+const ringPts = new THREE.EllipseCurve(0, 0, 1.21, 1.21).getPoints(120);
+const ring = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(ringPts), new THREE.LineBasicMaterial({ color: 0x6d8fd4, transparent: true, opacity: 0.28 }));
+scene.add(ring);
+
+// flight arcs — comet shader cycles land exactly on an integer number of loops
+function arcCurve(a, b, lift) {
+  const p0 = latLngToVec3(a.lat, a.lng, 1.002), p3 = latLngToVec3(b.lat, b.lng, 1.002);
+  const p1 = p0.clone().lerp(p3, 0.28).normalize().multiplyScalar(1 + lift);
+  const p2 = p0.clone().lerp(p3, 0.72).normalize().multiplyScalar(1 + lift);
+  return new THREE.CubicBezierCurve3(p0, p1, p2, p3);
+}
+const arcMats = [];
+function addArc(a, b, colorA, colorB, radius, base, speed, phase) {
+  const geo = new THREE.TubeGeometry(arcCurve(a, b, 0.32), 64, radius, 8, false);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uTime: { value: 0 }, uColorA: { value: new THREE.Color(colorA) }, uColorB: { value: new THREE.Color(colorB) }, uSpeed: { value: speed }, uBase: { value: base }, uPhase: { value: phase } },
+    vertexShader: ARC_VERT, fragmentShader: ARC_FRAG, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
+  });
+  earthGroup.add(new THREE.Mesh(geo, mat));
+  arcMats.push(mat);
+}
+// uSpeed * DURATION_S must be an integer for a seamless loop
+addArc({ lat: 4.2, lng: 102 }, { lat: 51.51, lng: -0.13 }, '#e8edf7', '#ffc24b', 0.0048, 0.35, 0.3, 0);      // KUL -> LON
+addArc({ lat: 40.71, lng: -74.0 }, { lat: 35.68, lng: 139.69 }, '#9fb4dd', '#c9d9ff', 0.003, 0.16, 0.2, 0.4); // NYC -> TOK
+addArc({ lat: 25.2, lng: 55.27 }, { lat: -33.87, lng: 151.21 }, '#9fb4dd', '#c9d9ff', 0.003, 0.16, 0.2, 0.75); // DXB -> SYD
+
+const glowTex = makeGlowTexture();
+[{ lat: 4.2, lng: 102 }, { lat: 51.51, lng: -0.13 }, { lat: 40.71, lng: -74.0 }, { lat: 35.68, lng: 139.69 }, { lat: 25.2, lng: 55.27 }, { lat: -33.87, lng: 151.21 }]
+  .forEach(hb => {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, opacity: 0.75, blending: THREE.AdditiveBlending, depthWrite: false }));
+    s.scale.setScalar(0.2);
+    s.position.copy(latLngToVec3(hb.lat, hb.lng, 1.014));
+    earthGroup.add(s);
+  });
+
+const baseRotY = -0.6;
+
+window.__ready = true;
+
+window.__renderFrame = (i, total) => {
+  const f = i / total;                       // 0 .. <1, exclusive endpoint = seamless loop
+  earthGroup.rotation.y = baseRotY + f * Math.PI * 2;      // exactly 1 revolution
+  // clouds stay locked to the surface: any non-integer relative drift would
+  // make the video jump at the loop seam
+  const t = f * DURATION_S;
+  arcMats.forEach(m => { m.uniforms.uTime.value = t; });
+  ring.quaternion.copy(camera.quaternion);
+  renderer.render(scene, camera);
+  // force the GPU to finish the draw before the caller screenshots — robust in
+  // both a real headless browser and a backgrounded tab (rAF never fires there)
+  renderer.getContext().finish();
+  return true;
+};
+
+window.__meta = { W, H, FPS, TOTAL_FRAMES };
+</script>
+</body>
+</html>
